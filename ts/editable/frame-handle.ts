@@ -44,7 +44,7 @@ function skippableNode(handleElement: FrameHandle, node: Node): boolean {
     );
 }
 
-function restoreHandleContent(mutations: MutationRecord[]): void {
+export function restoreHandleContent(mutations: MutationRecord[]): void {
     let referenceNode: Node | null = null;
 
     for (const mutation of mutations) {
