@@ -22,6 +22,7 @@ use anki_process::CommandExt as AnkiCommandExt;
 use anyhow::Context;
 use anyhow::Result;
 
+use crate::platform::ensure_os_supported;
 use crate::platform::ensure_terminal_shown;
 use crate::platform::get_exe_and_resources_dirs;
 use crate::platform::get_uv_binary_name;
@@ -110,11 +111,6 @@ fn run() -> Result<()> {
 
     // Create install directory and copy project files in
     create_dir_all(&state.uv_install_root)?;
-    let had_user_pyproj = state.user_pyproject_path.exists();
-    if !had_user_pyproj {
-        // during initial launcher testing, enable betas by default
-        write_file(&state.prerelease_marker, "")?;
-    }
 
     copy_if_newer(&state.dist_pyproject_path, &state.user_pyproject_path)?;
     copy_if_newer(
@@ -132,7 +128,7 @@ fn run() -> Result<()> {
     if !pyproject_has_changed {
         // If venv is already up to date, launch Anki normally
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let cmd = build_python_command(&state.uv_install_root, &args)?;
+        let cmd = build_python_command(&state, &args)?;
         launch_anki_normally(cmd)?;
         return Ok(());
     }
@@ -143,6 +139,8 @@ fn run() -> Result<()> {
     print!("\x1B[2J\x1B[H"); // Clear screen and move cursor to top
     println!("\x1B[1mAnki Launcher\x1B[0m\n");
 
+    ensure_os_supported()?;
+
     check_versions(&mut state);
 
     main_menu_loop(&state)?;
@@ -152,7 +150,7 @@ fn run() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        let cmd = build_python_command(&state.uv_install_root, &[])?;
+        let cmd = build_python_command(&state, &[])?;
         platform::mac::prepare_for_launch_after_update(cmd, &uv_install_root)?;
     }
 
@@ -286,6 +284,37 @@ fn main_menu_loop(state: &State) -> Result<()> {
                 // Remove sync marker before attempting sync
                 let _ = remove_file(&state.sync_complete_marker);
 
+                println!("\x1B[1mUpdating Anki...\x1B[0m\n");
+
+                let python_version_trimmed = if state.user_python_version_path.exists() {
+                    let python_version = read_file(&state.user_python_version_path)?;
+                    let python_version_str = String::from_utf8(python_version)
+                        .context("Invalid UTF-8 in .python-version")?;
+                    Some(python_version_str.trim().to_string())
+                } else {
+                    None
+                };
+
+                // `uv sync` does not pull in Python automatically, unlike `uv run`.
+                // This might be system/platform specific and/or a uv bug.
+                let mut command = Command::new(&state.uv_path);
+                command
+                    .current_dir(&state.uv_install_root)
+                    .env("UV_CACHE_DIR", &state.uv_cache_dir)
+                    .env("UV_PYTHON_INSTALL_DIR", &state.uv_python_install_dir)
+                    .args(["python", "install", "--managed-python"]);
+
+                // Add python version if .python-version file exists
+                if let Some(version) = &python_version_trimmed {
+                    command.args([version]);
+                }
+
+                if let Err(e) = command.ensure_success() {
+                    println!("Python install failed: {e:#}");
+                    println!();
+                    continue;
+                }
+
                 // Sync the venv
                 let mut command = Command::new(&state.uv_path);
                 command
@@ -295,12 +324,8 @@ fn main_menu_loop(state: &State) -> Result<()> {
                     .args(["sync", "--upgrade", "--managed-python"]);
 
                 // Add python version if .python-version file exists
-                if state.user_python_version_path.exists() {
-                    let python_version = read_file(&state.user_python_version_path)?;
-                    let python_version_str = String::from_utf8(python_version)
-                        .context("Invalid UTF-8 in .python-version")?;
-                    let python_version_trimmed = python_version_str.trim();
-                    command.args(["--python", python_version_trimmed]);
+                if let Some(version) = &python_version_trimmed {
+                    command.args(["--python", version]);
                 }
 
                 // Set UV_PRERELEASE=allow if beta mode is enabled
@@ -311,8 +336,6 @@ fn main_menu_loop(state: &State) -> Result<()> {
                 if state.no_cache_marker.exists() {
                     command.env("UV_NO_CACHE", "1");
                 }
-
-                println!("\x1B[1mUpdating Anki...\x1B[0m\n");
 
                 match command.ensure_success() {
                     Ok(_) => {
@@ -447,7 +470,7 @@ fn get_version_kind() -> VersionKind {
                 return version_kind;
             }
             None => {
-                println!("Invalid version format. Please enter a version like 24.10 or 25.06.1 (minimum 2.1.50)");
+                println!("Invalid version format. Please enter a version like 25.07.1 or 24.11 (minimum 2.1.50)");
                 continue;
             }
         }
@@ -671,24 +694,35 @@ fn handle_uninstall(state: &State) -> Result<bool> {
     Ok(true)
 }
 
-fn build_python_command(uv_install_root: &std::path::Path, args: &[String]) -> Result<Command> {
+fn build_python_command(state: &State, args: &[String]) -> Result<Command> {
     let python_exe = if cfg!(target_os = "windows") {
         let show_console = std::env::var("ANKI_CONSOLE").is_ok();
         if show_console {
-            uv_install_root.join(".venv/Scripts/python.exe")
+            state.uv_install_root.join(".venv/Scripts/python.exe")
         } else {
-            uv_install_root.join(".venv/Scripts/pythonw.exe")
+            state.uv_install_root.join(".venv/Scripts/pythonw.exe")
         }
     } else {
-        uv_install_root.join(".venv/bin/python")
+        state.uv_install_root.join(".venv/bin/python")
     };
 
-    let mut cmd = Command::new(python_exe);
+    let mut cmd = Command::new(&python_exe);
     cmd.args(["-c", "import aqt, sys; sys.argv[0] = 'Anki'; aqt.run()"]);
     cmd.args(args);
     // tell the Python code it was invoked by the launcher, and updating is
     // available
     cmd.env("ANKI_LAUNCHER", std::env::current_exe()?.utf8()?.as_str());
+
+    // Set UV and Python paths for the Python code
+    let (exe_dir, _) = get_exe_and_resources_dirs()?;
+    let uv_path = exe_dir.join(get_uv_binary_name());
+    cmd.env("ANKI_LAUNCHER_UV", uv_path.utf8()?.as_str());
+    cmd.env("UV_PROJECT", state.uv_install_root.utf8()?.as_str());
+
+    // Set UV_PRERELEASE=allow if beta mode is enabled
+    if state.prerelease_marker.exists() {
+        cmd.env("UV_PRERELEASE", "allow");
+    }
 
     Ok(cmd)
 }
